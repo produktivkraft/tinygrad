@@ -57,3 +57,15 @@ export PATH="$HOME/.local/bin:$PATH"
 ```bash
 DEV={AMD|NV} python3 tinygrad/apps/llm.py
 ```
+
+### CUDA shim on macOS
+
+There is a standalone CUDA Driver API shim prototype under `extra/usbgpu/tbgpu` that talks to TinyGPU's NVIDIA path directly.
+Use the vector-add demo to exercise the path:
+
+```bash
+python3 extra/usbgpu/tbgpu/vector_add_demo.py --kernel-input cuda --launch-mode extra
+python3 extra/usbgpu/tbgpu/vector_add_demo.py --kernel-input ptx --launch-mode kernel_params
+python3 extra/usbgpu/tbgpu/vector_add_demo.py --kernel-input ptx --emit-cubin /tmp/vector_add.cubin
+python3 extra/usbgpu/tbgpu/vector_add_demo.py --kernel-input cubin --cubin /tmp/vector_add.cubin
+```

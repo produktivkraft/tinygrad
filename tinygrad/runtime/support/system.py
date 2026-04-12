@@ -413,7 +413,7 @@ class APLRemotePCIDevice(RemotePCIDevice):
     print(system(f"{cls.APP_PATH} install"))
 
   def __init__(self, devpref:str, pcibus:str):
-    self.ensure_app()
+    # self.ensure_app()
     sock_path, sock = getenv("APL_REMOTE_SOCK", temp("tinygpu.sock")), socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     for i in range(100):
       with contextlib.suppress(ConnectionRefusedError, FileNotFoundError):
