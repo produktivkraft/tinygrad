@@ -1,203 +1,108 @@
-"""This is where the forwards and backwards passes live."""
-import math
-from tinygrad.helpers import argsort
-from tinygrad.dtype import dtypes, DType, sum_acc_dtype
-from tinygrad.ops import Ops, resolve, sint, UOp
-from tinygrad.tensor import Function
+import functools, itertools, time
+from typing import Generic, TypeVar, Callable, cast, overload
+from tinygrad.helpers import Context, dedup, getenv, DEBUG
+from tinygrad.uop.ops import UOp, Ops, graph_rewrite, PatternMatcher, UPat
+from tinygrad.tensor import Tensor
+from tinygrad.nn.state import get_state_dict
 
-class Contiguous(Function):
-  def forward(self, x:UOp) -> UOp: return x.contiguous()
-  def backward(self, grad_output:UOp) -> UOp: return grad_output
+def add_to_ctx(ctx, x:UOp):
+  ret = x.param_like(len(ctx[0]))
+  ctx[0].append(x)
+  return ret
 
-class ContiguousBackward(Function):
-  def forward(self, x:UOp) -> UOp: return x
-  def backward(self, grad_output:UOp) -> UOp: return grad_output.contiguous()
+pm_transform_unique_const = PatternMatcher([
+  # transform unique consts to LUNIQUE
+  (UPat(Ops.CONST, src=(UPat(Ops.UNIQUE), UPat(Ops.DEVICE)), name="x"),
+   lambda ctx,x: x.replace(src=(UOp(Ops.LUNIQUE, arg=next(ctx[1])), x.src[1]))),
+])
 
-class Cast(Function):
-  def forward(self, x:UOp, dtype:DType, bitcast:bool=False) -> UOp:
-    self.input_dtype, self.bitcast = x.dtype, bitcast
-    return x.bitcast(dtype) if self.bitcast else x.cast(dtype)
+pm_ctx = PatternMatcher([
+  (UPat((Ops.BUFFER, Ops.BIND), name="x"), add_to_ctx),
+  (UPat((Ops.AFTER, Ops.CONTIGUOUS), name="x"),
+   lambda ctx,x: add_to_ctx(ctx,x) if not x.op_in_backward_slice_with_self(Ops.PARAM) and x.op_in_backward_slice_with_self(Ops.BUFFER) else None),
+])+pm_transform_unique_const
 
-  def backward(self, grad_output:UOp) -> UOp:
-    if self.bitcast: raise RuntimeError("bitcast cannot backward")
-    return grad_output.cast(self.input_dtype)
+ReturnType = TypeVar('ReturnType')
+class _function(Generic[ReturnType]):
+  depth = 0
+  def __init__(self, fxn:Callable[..., ReturnType], *, precompile:bool, precompile_backward:bool, allow_implicit:bool, grad_fxn:Callable|None):
+    self.fxn = fxn
+    self.precompile = precompile
+    self.precompile_backward = precompile_backward
+    self.allow_implicit = allow_implicit
+    self.grad_fxn = grad_fxn
 
-# ************* unary ops *************
+  def __get__(self, obj, objtype=None): return functools.partial(self.__call__, obj) if obj is not None else self
 
-class Reciprocal(Function):
-  def forward(self, x:UOp) -> UOp:
-    self.ret = x.reciprocal()
-    return self.ret
+  def __call__(self, *args, **kwargs) -> ReturnType:
+    st = time.perf_counter()
 
-  def backward(self, grad_output:UOp) -> UOp: return -grad_output * self.ret * self.ret
+    params = get_state_dict((args, kwargs), tensor_type=(Tensor, UOp)).values()
 
-class Sin(Function):
-  def forward(self, x:UOp) -> UOp:
-    self.x = x
-    return x.sin()
+    # deduplicate input_uops, keeping the first occurrence index for each unique uop
+    call_uops: list[UOp] = dedup([(t.uop if isinstance(t, Tensor) else t) for t in params])
 
-  def backward(self, grad_output:UOp) -> UOp: return (math.pi/2 - self.x).sin() * grad_output
+    # disable realize/schedule while this is running
+    # run it and do surgery later
+    with Context(ALLOW_DEVICE_USAGE=getenv("DEVICE_IN_FUNCTION_BUG", 0)):
+      _function.depth += 1
+      ret = self.fxn(*args, **kwargs)
+      _function.depth -= 1
+    if isinstance(ret, Tensor):
+      uret = ret.uop
+    elif isinstance(ret, tuple) and all(isinstance(x, Tensor) for x in ret):
+      uret = UOp.maketuple(*[x.uop for x in ret])
+    else:
+      raise RuntimeError(f"function return type {type(ret)} not supported")
 
-class Relu(Function):
-  def forward(self, x:UOp) -> UOp:
-    self.ret = (x>0).where(x, 0)
-    return self.ret
+    # replace the known inputs with params (using deduplicated slots)
+    subs = {}
+    for i,x in enumerate(call_uops): subs[x] = x.param_like(i)
+    uret = uret.substitute(subs)
 
-  def backward(self, grad_output:UOp) -> UOp: return (self.ret>0).cast(grad_output.dtype) * grad_output
+    # add contiguous to call_uops
+    #call_uops = [x.contiguous() for x in call_uops]
 
-class Log(Function):
-  def forward(self, x:UOp) -> UOp:
-    self.x = x
-    return x.log2() * math.log(2)
+    # the BUFFERs that are left are the implicit inputs
+    num_explicit = len(call_uops)
+    uret = graph_rewrite(uret, pm_ctx, (call_uops, itertools.count(0)), bottom_up=True, name="get_implicit_inputs")
+    name = getattr(self.fxn, '__qualname__', None) or type(self.fxn).__qualname__
+    if not self.allow_implicit:
+      implicit_buffers = [x for x in call_uops[num_explicit:] if x.op is Ops.BUFFER]
+      if implicit_buffers:
+        buf_strs = '\n  '.join(f"{i}: dtype={b.dtype}, size={b.size}, device={b.device}" for i,b in enumerate(implicit_buffers))
+        raise RuntimeError(f"function {name} has {len(implicit_buffers)} implicit buffer(s), but allow_implicit=False\n  {buf_strs}")
 
-  def backward(self, grad_output:UOp) -> UOp: return grad_output / self.x
+    # assign output
+    #pbuffer = uret.param_like(len(call_uops))
+    #assigned = pbuffer.assign(uret).sink()
+    #buffer = UOp.new_buffer(pbuffer.device, pbuffer.size, pbuffer.dtype).reshape(uret.shape)
+    #call = assigned.call(*call_uops, buffer, name=name)
+    #ret = buffer.after(call)
 
-class Exp(Function):
-  def forward(self, x:UOp) -> UOp:
-    self.ret = (x * (1/math.log(2))).exp2()
-    return self.ret
+    fret = uret.call(*call_uops, grad_fxn=self.grad_fxn, name=name, precompile=self.precompile,
+                     precompile_backward=self.precompile_backward)
 
-  def backward(self, grad_output:UOp) -> UOp: return self.ret * grad_output
+    if DEBUG >= 2:
+      #signature = [(x._shape, x.dtype, x._device) for x in call_uops]
+      print("  "*_function.depth+f"function {uret.key.hex()[:8]} in {(time.perf_counter()-st)*1000:8.2f} ms: {name}") # with sig {signature}")
 
-class Sqrt(Function):
-  def forward(self, x:UOp) -> UOp:
-    self.ret = x.sqrt()
-    return self.ret
+    if isinstance(ret, tuple):
+      return cast(ReturnType, tuple(Tensor(fret.gettuple(i)) for i in range(len(ret))))
+    else:
+      return cast(ReturnType, Tensor(fret.gettuple(0)))
 
-  def backward(self, grad_output:UOp) -> UOp: return grad_output / (self.ret*2)
-
-class Sign(Function):
-  # NOTE: the x*0 is to match torch behavior without function.py
-  def forward(self, x:UOp) -> UOp: return x.ne(0).where((x<0).where(x.const_like(-1), x.const_like(1)), x.const_like(0)) + x*0
-  # backward always return 0 to match torch
-  def backward(self, grad_output:UOp) -> UOp: return grad_output.const_like(0)
-
-# ************* binary ops *************
-
-class Less(Function):
-  def forward(self, x:UOp, y:UOp) -> UOp: return x<y
-  def backward(self, grad_output:UOp) -> tuple[UOp|None, UOp|None]: return None, None
-
-class Neq(Function):
-  def forward(self, x:UOp, y:UOp) -> UOp: return x.ne(y)
-  def backward(self, grad_output:UOp) -> tuple[UOp|None, UOp|None]: return None, None
-
-class Xor(Function):
-  def forward(self, x:UOp, y:UOp) -> UOp: return x^y
-
-class BitwiseAnd(Function):
-  def forward(self, x:UOp, y:UOp) -> UOp: return x&y
-
-class BitwiseOr(Function):
-  def forward(self, x:UOp, y:UOp) -> UOp: return x|y
-
-class Threefry(Function):
-  def forward(self, x:UOp, seed:UOp) -> UOp: return x.threefry(seed)
-
-class Add(Function):
-  def forward(self, x:UOp, y:UOp) -> UOp: return x+y
-
-  def backward(self, grad_output:UOp) -> tuple[UOp|None, UOp|None]:
-    return grad_output if self.needs_input_grad[0] else None, \
-           grad_output if self.needs_input_grad[1] else None
-
-class Mul(Function):
-  def forward(self, x:UOp, y:UOp) -> UOp:
-    self.x, self.y = x, y
-    return x * y
-
-  def backward(self, grad_output:UOp) -> tuple[UOp|None, UOp|None]:
-    return (self.y * grad_output) if self.needs_input_grad[0] else None, \
-           (self.x * grad_output) if self.needs_input_grad[1] else None
-
-class IDiv(Function):
-  def forward(self, x:UOp, y:UOp) -> UOp: return x // y
-
-class Mod(Function):
-  def forward(self, x:UOp, y:UOp) -> UOp: return x % y
-
-# ************* ternary ops *************
-
-class Where(Function):
-  def forward(self, x:UOp, y:UOp, z:UOp) -> UOp:
-    self.x = x
-    return self.x.where(y, z)
-
-  def backward(self, grad_output:UOp) -> tuple[None, UOp|None, UOp|None]:
-    return None, \
-      self.x.where(grad_output, grad_output.const_like(0)) if self.needs_input_grad[1] else None, \
-      self.x.where(grad_output.const_like(0), grad_output) if self.needs_input_grad[2] else None
-
-# ************* reduce ops *************
-
-class Sum(Function):
-  def forward(self, x:UOp, axis:tuple[int, ...]) -> UOp:
-    self.input_shape = x.shape
-    return x.r(Ops.ADD, axis)
-
-  def backward(self, grad_output:UOp) -> UOp: return grad_output.expand(self.input_shape)
-
-class Prod(Function):
-  def forward(self, x:UOp, axis:tuple[int, ...]) -> UOp:
-    self.x, self.ret = x, x.r(Ops.MUL, axis)
-    return self.ret
-
-  def backward(self, grad_output:UOp) -> UOp:
-    return (grad_output * self.ret).expand(self.x.shape) / self.x
-
-class Max(Function):
-  def forward(self, x:UOp, axis:tuple[int, ...]) -> UOp:
-    self.x, self.ret, self.axis = x, x.r(Ops.MAX, axis), axis
-    return self.ret
-
-  def backward(self, grad_output:UOp) -> UOp:
-    # 1s in locations where the max was chosen (can be two locations)
-    max_is_1s = self.x.ne(self.ret.expand(self.x.shape)).ne(self.x.const_like(1).cast(dtypes.bool)).cast(grad_output.dtype)
-    div = max_is_1s.r(Ops.ADD, self.axis).expand(self.x.shape)
-    return (max_is_1s/div) * grad_output.expand(self.x.shape)
-
-# ************* movement ops *************
-
-# NOTE: this is sum in reverse
-class Expand(Function):
-  def forward(self, x:UOp, shape:tuple[int, ...]) -> UOp:
-    self.expanded_axis = tuple(i for i, (si, so) in enumerate(zip(x.shape, shape)) if resolve(si != so))
-    return x.expand(shape)
-
-  def backward(self, grad_output:UOp) -> UOp:
-    return grad_output.cast(sum_acc_dtype(grad_output.dtype)).r(Ops.ADD, self.expanded_axis).cast(grad_output.dtype)
-
-class Reshape(Function):
-  def forward(self, x:UOp, shape:tuple[int, ...]) -> UOp:
-    self.input_shape = x.shape
-    return x.reshape(shape)
-
-  def backward(self, grad_output:UOp) -> UOp: return grad_output.reshape(self.input_shape)
-
-class Permute(Function):
-  def forward(self, x:UOp, order:tuple[int, ...]) -> UOp:
-    self.input_order = order
-    return x.permute(order)
-
-  def backward(self, grad_output:UOp) -> UOp: return grad_output.permute(argsort(self.input_order))
-
-class Pad(Function):
-  def forward(self, x:UOp, arg:tuple[tuple[int, int], ...]) -> UOp:
-    self.narg = tuple([(p[0], s+p[0]) for s,p in zip(x.shape, arg)])
-    return x.pad(arg)
-
-  def backward(self, grad_output:UOp) -> UOp: return grad_output.shrink(self.narg)
-
-class Shrink(Function):
-  def forward(self, x:UOp, arg:tuple[tuple[sint, sint], ...]) -> UOp:
-    self.narg = tuple([(p[0], s-p[1]) for s,p in zip(x.shape, arg)])
-    return x.shrink(arg)
-
-  def backward(self, grad_output:UOp) -> UOp: return grad_output.pad(self.narg)
-
-class Flip(Function):
-  def forward(self, x:UOp, axis:tuple[int, ...]) -> UOp:
-    self.arg = tuple([-1 if i in axis else 1 for i in range(len(x.shape))])
-    return x.stride(self.arg)
-
-  def backward(self, grad_output:UOp) -> UOp: return grad_output.stride(self.arg)
+# overload signatures support both @function and @function(precompile=True) syntax
+@overload
+def function(fxn:Callable[..., ReturnType], *, precompile:bool=False, precompile_backward:bool=False,
+             allow_implicit:bool=False, grad_fxn:Callable|None=None) -> _function[ReturnType]: ...
+@overload
+def function(fxn:None=None, *, precompile:bool=False, precompile_backward:bool=False,
+             allow_implicit:bool=False, grad_fxn:Callable|None=None) -> Callable[[Callable[..., ReturnType]], _function[ReturnType]]: ...
+def function(fxn=None, *, precompile:bool=False, precompile_backward:bool=False,
+             allow_implicit:bool=False, grad_fxn:Callable|None=None):
+  if fxn is None:
+    return lambda f: _function(f, precompile=precompile, precompile_backward=precompile_backward,
+                               allow_implicit=allow_implicit, grad_fxn=grad_fxn)
+  return _function(fxn, precompile=precompile, precompile_backward=precompile_backward,
+                   allow_implicit=allow_implicit, grad_fxn=grad_fxn)
