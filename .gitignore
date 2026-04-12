@@ -61,5 +61,10 @@ comgr_*
 !extra/sqtt/examples/**/*.pkl
 site/
 profile_stats
-
-*.dylib
+*.log
+target
+.mypy_cache
+mutants
+.mutmut-cache
+dagre/
+graphlib/
