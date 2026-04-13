@@ -5,6 +5,7 @@ if __package__ in (None, ""):
   sys.path.insert(0, pathlib.Path(__file__).resolve().parents[3].as_posix())
 
 from extra.usbgpu.tbgpu import cuda_shim as cuda
+from tinygrad.runtime.support.c import del_an, init_c_var
 
 KERNEL_NAME = "vector_add"
 
@@ -157,24 +158,24 @@ def _make_kernel_params(args:VecAddArgs):
 def run_vector_add(size:int=256, block_size:int=64, launch_mode:str="extra", kernel_input:str="ptx", cubin_path:str|None=None,
                    emit_ptx:str|None=None, emit_cubin:str|None=None) -> array.array:
   _check(cuda.cuInit(0))
-  _check(cuda.cuDeviceGet(ctypes.byref(dev := cuda.CUdevice()), 0))
-  _check(cuda.cuCtxCreate_v2(ctypes.byref(ctx := cuda.CUcontext()), 0, dev))
+  dev = init_c_var(cuda.CUdevice, lambda x: _check(cuda.cuDeviceGet(ctypes.byref(x), 0)))
+  ctx = init_c_var(cuda.CUcontext, lambda x: _check(cuda.cuCtxCreate_v2(ctypes.byref(x), 0, dev.value)))
   _check(cuda.cuCtxSetCurrent(ctx))
   _check(cuda.cuDeviceComputeCapability(ctypes.byref(major := ctypes.c_int()), ctypes.byref(minor := ctypes.c_int()), dev.value))
 
   arch = f"sm_{major.value}{minor.value}"
   kernel_image = load_kernel_image(arch, kernel_input, cubin_path=cubin_path, emit_ptx=emit_ptx, emit_cubin=emit_cubin)
-  _check(cuda.cuModuleLoadData(ctypes.byref(module := cuda.CUmodule()), kernel_image))
-  _check(cuda.cuModuleGetFunction(ctypes.byref(func := cuda.CUfunction()), module, KERNEL_NAME.encode()))
+  module = init_c_var(cuda.CUmodule, lambda x: _check(cuda.cuModuleLoadData(ctypes.byref(x), kernel_image)))
+  func = init_c_var(cuda.CUfunction, lambda x: _check(cuda.cuModuleGetFunction(ctypes.byref(x), module, KERNEL_NAME.encode())))
 
   a = array.array('f', (float(i) for i in range(size)))
   b = array.array('f', (float(2 * i + 1) for i in range(size)))
   out = array.array('f', [0.0] * size)
 
   nbytes = size * ctypes.sizeof(ctypes.c_float)
-  d_a = cuda.CUdeviceptr()
-  d_b = cuda.CUdeviceptr()
-  d_out = cuda.CUdeviceptr()
+  d_a = del_an(cuda.CUdeviceptr)()
+  d_b = del_an(cuda.CUdeviceptr)()
+  d_out = del_an(cuda.CUdeviceptr)()
 
   try:
     _check(cuda.cuMemAlloc_v2(ctypes.byref(d_a), nbytes))
