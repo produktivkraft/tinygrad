@@ -1,5 +1,5 @@
 from __future__ import annotations
-import argparse, array, ctypes, math, pathlib, shutil, subprocess, sys, tempfile
+import argparse, array, ctypes, pathlib, shutil, struct, subprocess, sys, tempfile
 
 if __package__ in (None, ""):
   sys.path.insert(0, pathlib.Path(__file__).resolve().parents[3].as_posix())
@@ -142,17 +142,30 @@ def _buffer_ptr(buf:array.array) -> int:
   return ctypes.addressof((ctypes.c_float * len(buf)).from_buffer(buf))
 
 
+def _encode_args_blob(args:VecAddArgs) -> bytes:
+  return struct.pack("<QQQI", args.a, args.b, args.c, args.n)
+
+
 def _make_extra(args:VecAddArgs):
-  arg_size = ctypes.c_size_t(ctypes.sizeof(args))
-  extra = (ctypes.c_void_p * 5)(ctypes.c_void_p(1), ctypes.cast(ctypes.byref(args), ctypes.c_void_p), ctypes.c_void_p(2),
+  arg_blob = _encode_args_blob(args)
+  arg_buf = ctypes.create_string_buffer(arg_blob)
+  arg_size = ctypes.c_size_t(len(arg_blob))
+  extra = (ctypes.c_void_p * 5)(ctypes.c_void_p(1), ctypes.cast(arg_buf, ctypes.c_void_p), ctypes.c_void_p(2),
                                 ctypes.cast(ctypes.pointer(arg_size), ctypes.c_void_p), ctypes.c_void_p(0))
-  return extra, arg_size
+  return extra, (arg_buf, arg_size)
 
 
 def _make_kernel_params(args:VecAddArgs):
   scalars = [ctypes.c_uint64(args.a), ctypes.c_uint64(args.b), ctypes.c_uint64(args.c), ctypes.c_uint32(args.n)]
   params = (ctypes.c_void_p * len(scalars))(*[ctypes.addressof(v) for v in scalars])
   return params, scalars
+
+
+def _iter_chunk_args(size:int, block_size:int, a_ptr:int, b_ptr:int, out_ptr:int):
+  itemsize = ctypes.sizeof(ctypes.c_float)
+  for offset in range(0, size, block_size):
+    byte_offset = offset * itemsize
+    yield VecAddArgs(a_ptr + byte_offset, b_ptr + byte_offset, out_ptr + byte_offset, min(block_size, size - offset))
 
 
 def run_vector_add(size:int=256, block_size:int=64, launch_mode:str="extra", kernel_input:str="ptx", cubin_path:str|None=None,
@@ -184,16 +197,16 @@ def run_vector_add(size:int=256, block_size:int=64, launch_mode:str="extra", ker
     _check(cuda.cuMemcpyHtoDAsync_v2(d_a, _buffer_ptr(a), nbytes, None))
     _check(cuda.cuMemcpyHtoDAsync_v2(d_b, _buffer_ptr(b), nbytes, None))
 
-    args = VecAddArgs(d_a.value, d_b.value, d_out.value, size)
-    grid = (math.ceil(size / block_size), 1, 1)
     block = (block_size, 1, 1)
-
-    if launch_mode == "kernel_params":
-      params, keepalive = _make_kernel_params(args)
-      _check(cuda.cuLaunchKernel(func, *grid, *block, 0, None, params, None))
-    else:
-      extra, keepalive = _make_extra(args)
-      _check(cuda.cuLaunchKernel(func, *grid, *block, 0, None, None, extra))
+    # TODO: Restore a single multi-CTA launch once the standalone tbgpu/NV cubin path handles grid.x > 1 correctly.
+    # Keep the demo on one CTA per launch for now so it stays correct without depending on tinygrad's main runtime.
+    for args in _iter_chunk_args(size, block_size, d_a.value, d_b.value, d_out.value):
+      if launch_mode == "kernel_params":
+        params, keepalive = _make_kernel_params(args)
+        _check(cuda.cuLaunchKernel(func, 1, 1, 1, *block, 0, None, params, None))
+      else:
+        extra, keepalive = _make_extra(args)
+        _check(cuda.cuLaunchKernel(func, 1, 1, 1, *block, 0, None, None, extra))
 
     _check(cuda.cuCtxSynchronize())
     _check(cuda.cuMemcpyDtoH_v2(_buffer_ptr(out), d_out, nbytes))

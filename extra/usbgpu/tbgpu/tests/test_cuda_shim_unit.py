@@ -1,4 +1,4 @@
-import ctypes, pathlib, tempfile, sys, unittest
+import pathlib, tempfile, sys, unittest
 from unittest import mock
 
 sys.path.insert(0, pathlib.Path(__file__).resolve().parents[4].as_posix())
@@ -22,14 +22,29 @@ class TestCUDAShimHelpers(unittest.TestCase):
     args = VecAddArgs(0x11, 0x22, 0x33, 7)
     extra, _ = _make_extra(args)
     blob = cuda_shim._extract_extra_blob(extra)
-    self.assertEqual(blob, ctypes.string_at(ctypes.byref(args), ctypes.sizeof(args)))
+    self.assertEqual(blob, demo._encode_args_blob(args))
 
   def test_marshal_kernel_params(self):
     args = VecAddArgs(0x11, 0x22, 0x33, 7)
     params, _ = _make_kernel_params(args)
     sig = cuda_shim._parse_ptx_signatures(demo.render_vector_add_ptx("sm_89"))["vector_add"]
     blob = cuda_shim._marshal_kernel_params(params, sig)
-    self.assertEqual(blob, ctypes.string_at(ctypes.byref(args), len(blob)))
+    self.assertEqual(blob, demo._encode_args_blob(args))
+
+  def test_extra_matches_kernel_params_blob(self):
+    args = VecAddArgs(0x11, 0x22, 0x33, 7)
+    extra, _ = _make_extra(args)
+    params, _ = _make_kernel_params(args)
+    sig = cuda_shim._parse_ptx_signatures(demo.render_vector_add_ptx("sm_89"))["vector_add"]
+    self.assertEqual(cuda_shim._extract_extra_blob(extra), cuda_shim._marshal_kernel_params(params, sig))
+
+  def test_iter_chunk_args(self):
+    launches = list(demo._iter_chunk_args(130, 64, 0x1000, 0x2000, 0x3000))
+    self.assertEqual([(a.a, a.b, a.c, a.n) for a in launches], [
+      (0x1000, 0x2000, 0x3000, 64),
+      (0x1100, 0x2100, 0x3100, 64),
+      (0x1200, 0x2200, 0x3200, 2),
+    ])
 
   def test_load_kernel_image_cuda_path(self):
     with tempfile.TemporaryDirectory() as tmpdir:
