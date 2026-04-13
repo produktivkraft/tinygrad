@@ -10,10 +10,8 @@ from tinygrad.runtime.support.c import del_an, init_c_var
 KERNEL_NAME = "vector_add"
 
 VECTOR_ADD_CUDA = r'''
-extern "C" __global__ void vector_add(const float *a, const float *b, float *c, unsigned int n, unsigned int block_size) {
-  // NOTE: On the standalone tbgpu/NV cubin path, reading %ntid.x has been observed to return 0.
-  // Use host-provided block_size for idx math so multi-CTA launch remains correct.
-  unsigned int idx = blockIdx.x * block_size + threadIdx.x;
+extern "C" __global__ void vector_add(const float *a, const float *b, float *c, unsigned int n) {
+  unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
   if (idx < n) c[idx] = a[idx] + b[idx];
 }
 '''
@@ -26,24 +24,23 @@ VECTOR_ADD_PTX = r'''.version VERSION
   .param .u64 a,
   .param .u64 b,
   .param .u64 c,
-  .param .u32 n,
-  .param .u32 block_size
+  .param .u32 n
 )
 {
   .reg .pred %p<2>;
   .reg .f32 %f<4>;
-  .reg .b32 %r<7>;
+  .reg .b32 %r<6>;
   .reg .b64 %rd<8>;
 
   ld.param.u64 %rd1, [a];
   ld.param.u64 %rd2, [b];
   ld.param.u64 %rd3, [c];
   ld.param.u32 %r1, [n];
-  ld.param.u32 %r2, [block_size];
 
-  mov.u32 %r3, %ctaid.x;
+  mov.u32 %r2, %ctaid.x;
+  mov.u32 %r3, %ntid.x;
   mov.u32 %r4, %tid.x;
-  mad.lo.s32 %r5, %r3, %r2, %r4;
+  mad.lo.s32 %r5, %r2, %r3, %r4;
   setp.ge.u32 %p1, %r5, %r1;
   @%p1 bra DONE;
 
@@ -62,7 +59,7 @@ DONE:
 '''
 
 class VecAddArgs(ctypes.Structure):
-  _fields_ = [("a", ctypes.c_uint64), ("b", ctypes.c_uint64), ("c", ctypes.c_uint64), ("n", ctypes.c_uint32), ("block_size", ctypes.c_uint32)]
+  _fields_ = [("a", ctypes.c_uint64), ("b", ctypes.c_uint64), ("c", ctypes.c_uint64), ("n", ctypes.c_uint32)]
 
 
 def render_vector_add_cuda() -> str:
@@ -146,7 +143,7 @@ def _buffer_ptr(buf:array.array) -> int:
 
 
 def _encode_args_blob(args:VecAddArgs) -> bytes:
-  return struct.pack("<QQQII", args.a, args.b, args.c, args.n, args.block_size)
+  return struct.pack("<QQQI", args.a, args.b, args.c, args.n)
 
 
 def _make_extra(args:VecAddArgs):
@@ -159,7 +156,7 @@ def _make_extra(args:VecAddArgs):
 
 
 def _make_kernel_params(args:VecAddArgs):
-  scalars = [ctypes.c_uint64(args.a), ctypes.c_uint64(args.b), ctypes.c_uint64(args.c), ctypes.c_uint32(args.n), ctypes.c_uint32(args.block_size)]
+  scalars = [ctypes.c_uint64(args.a), ctypes.c_uint64(args.b), ctypes.c_uint64(args.c), ctypes.c_uint32(args.n)]
   params = (ctypes.c_void_p * len(scalars))(*[ctypes.addressof(v) for v in scalars])
   return params, scalars
 
@@ -197,8 +194,7 @@ def run_vector_add(size:int=256, block_size:int=64, launch_mode:str="extra", ker
     block = (block_size, 1, 1)
     if size > 0:
       grid = ((size + block_size - 1) // block_size, 1, 1)
-      # Keep block_size in args for parity with the CUDA source and handwritten PTX kernel path.
-      args = VecAddArgs(d_a.value, d_b.value, d_out.value, size, block_size)
+      args = VecAddArgs(d_a.value, d_b.value, d_out.value, size)
       if launch_mode == "kernel_params":
         params, keepalive = _make_kernel_params(args)
         _check(cuda.cuLaunchKernel(func, *grid, *block, 0, None, params, None))

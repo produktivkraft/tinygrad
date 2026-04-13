@@ -189,6 +189,14 @@ def _patch_shared_mem(prg, shared_mem_bytes:int) -> bytes | None:
 def _restore_shared_mem(prg, original:bytes | None):
   if original is not None: prg.qmd.mv[:] = original
 
+def _build_launch_cbuf0(prg, grid:tuple[int, int, int], block:tuple[int, int, int]) -> bytes:
+  if not prg.cbuf_0: return b''
+  cbuf_words = list(prg.cbuf_0)
+  # PTXAS lowers blockDim/gridDim (and sometimes blockDim in idx math) to const0 slots.
+  # Keep these launch constants in sync for each dispatch instead of leaving static zeros.
+  if len(cbuf_words) >= 6: cbuf_words[0:6] = [int(block[0]), int(block[1]), int(block[2]), int(grid[0]), int(grid[1]), int(grid[2])]
+  return array.array('I', cbuf_words).tobytes()
+
 @functools.lru_cache(maxsize=None)
 def _compile_ptx_to_cubin(ptx:bytes, arch:str) -> bytes:
   if shutil.which("nvcc") is None: raise RuntimeError("nvcc not found, run extra/setup_nvcc_osx.sh or load a cubin image directly")
@@ -213,7 +221,7 @@ def _launch(function:_FunctionState, arg_blob:bytes, grid:tuple[int, int, int], 
   prg = _ensure_program(function)
   dev = prg.dev
   argsbuf = dev.kernargs_buf.offset(offset=dev.kernargs_offset_allocator.alloc(prg.kernargs_alloc_size, 8), size=prg.kernargs_alloc_size)
-  prefix = array.array('I', prg.cbuf_0).tobytes() if prg.cbuf_0 else b''
+  prefix = _build_launch_cbuf0(prg, grid, block)
   view = argsbuf.cpu_view().view(fmt='B')
   view[:len(prefix)] = prefix
   view[len(prefix):len(prefix)+len(arg_blob)] = arg_blob
