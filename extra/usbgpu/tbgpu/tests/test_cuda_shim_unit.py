@@ -11,7 +11,7 @@ class TestCUDAShimHelpers(unittest.TestCase):
   def test_parse_vector_add_signature(self):
     sigs = cuda_shim._parse_ptx_signatures(demo.render_vector_add_ptx("sm_89"))
     self.assertIn("vector_add", sigs)
-    self.assertEqual([(p.size, p.align) for p in sigs["vector_add"]], [(8, 8), (8, 8), (8, 8), (4, 4)])
+    self.assertEqual([(p.size, p.align) for p in sigs["vector_add"]], [(8, 8), (8, 8), (8, 8), (4, 4), (4, 4)])
 
   def test_render_vector_add_cuda(self):
     src = demo.render_vector_add_cuda()
@@ -19,32 +19,24 @@ class TestCUDAShimHelpers(unittest.TestCase):
     self.assertIn('c[idx] = a[idx] + b[idx];', src)
 
   def test_extract_extra_blob(self):
-    args = VecAddArgs(0x11, 0x22, 0x33, 7)
+    args = VecAddArgs(0x11, 0x22, 0x33, 7, 64)
     extra, _ = _make_extra(args)
     blob = cuda_shim._extract_extra_blob(extra)
     self.assertEqual(blob, demo._encode_args_blob(args))
 
   def test_marshal_kernel_params(self):
-    args = VecAddArgs(0x11, 0x22, 0x33, 7)
+    args = VecAddArgs(0x11, 0x22, 0x33, 7, 64)
     params, _ = _make_kernel_params(args)
     sig = cuda_shim._parse_ptx_signatures(demo.render_vector_add_ptx("sm_89"))["vector_add"]
     blob = cuda_shim._marshal_kernel_params(params, sig)
     self.assertEqual(blob, demo._encode_args_blob(args))
 
   def test_extra_matches_kernel_params_blob(self):
-    args = VecAddArgs(0x11, 0x22, 0x33, 7)
+    args = VecAddArgs(0x11, 0x22, 0x33, 7, 64)
     extra, _ = _make_extra(args)
     params, _ = _make_kernel_params(args)
     sig = cuda_shim._parse_ptx_signatures(demo.render_vector_add_ptx("sm_89"))["vector_add"]
     self.assertEqual(cuda_shim._extract_extra_blob(extra), cuda_shim._marshal_kernel_params(params, sig))
-
-  def test_iter_chunk_args(self):
-    launches = list(demo._iter_chunk_args(130, 64, 0x1000, 0x2000, 0x3000))
-    self.assertEqual([(a.a, a.b, a.c, a.n) for a in launches], [
-      (0x1000, 0x2000, 0x3000, 64),
-      (0x1100, 0x2100, 0x3100, 64),
-      (0x1200, 0x2200, 0x3200, 2),
-    ])
 
   def test_load_kernel_image_cuda_path(self):
     with tempfile.TemporaryDirectory() as tmpdir:
