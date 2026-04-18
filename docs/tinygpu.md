@@ -55,7 +55,7 @@ export PATH="$HOME/.local/bin:$PATH"
 ### 5. Use it!
 
 ```bash
-DEV={AMD|NV} python3 tinygrad/apps/llm.py
+DEV={AMD|NV} python3 -m tinygrad.llm
 ```
 
 ### CUDA shim on macOS
@@ -69,3 +69,5 @@ python3 extra/usbgpu/tbgpu/vector_add_demo.py --kernel-input ptx --launch-mode k
 python3 extra/usbgpu/tbgpu/vector_add_demo.py --kernel-input ptx --emit-cubin /tmp/vector_add.cubin
 python3 extra/usbgpu/tbgpu/vector_add_demo.py --kernel-input cubin --cubin /tmp/vector_add.cubin
 ```
+
+**Note:** Use `JITBEAM=2` to search for faster kernels (one-time search cost, results cached).
