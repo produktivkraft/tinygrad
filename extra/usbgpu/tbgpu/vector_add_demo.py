@@ -18,6 +18,8 @@ if __package__ in (None, ""):
 from extra.usbgpu.tbgpu import cuda_shim as cuda
 from tinygrad.runtime.support.c import init_c_var
 
+# DEBUG=3 DEV=NV python extra/usbgpu/tbgpu/vector_add_demo.py --kernel-input cuda --launch-mode extra
+
 KERNEL_NAME = "vector_add"
 
 VECTOR_ADD_CUDA = r'''
