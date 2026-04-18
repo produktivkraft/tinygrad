@@ -92,7 +92,7 @@ def render_vector_add_ptx(arch:str) -> bytes:
 
 def _require_nvcc() -> str:
   if (nvcc:=shutil.which("nvcc")) is None:
-    raise RuntimeError("nvcc not found, run extra/setup_nvcc_osx.sh or use --kernel-input cubin with a prebuilt cubin")
+    raise RuntimeError("nvcc not found, run extra/setup_nvcc_osx.sh")
   return nvcc
 
 
@@ -120,26 +120,18 @@ def _write_if_requested(path:str|None, data:bytes):
   if path is not None: pathlib.Path(path).write_bytes(data)
 
 
-def load_kernel_image(arch:str, kernel_input:str, cubin_path:str|None=None, emit_ptx:str|None=None, emit_cubin:str|None=None) -> bytes:
+def load_kernel_image(arch:str, kernel_input:str, emit_ptx:str|None=None, emit_cubin:str|None=None) -> bytes:
   if kernel_input == "cuda":
     ptx = compile_cuda_to_ptx(render_vector_add_cuda(), arch)
-    cubin = compile_ptx_to_cubin(ptx, arch)
     _write_if_requested(emit_ptx, ptx)
-    _write_if_requested(emit_cubin, cubin)
-    return cubin
+    if emit_cubin is not None: _write_if_requested(emit_cubin, compile_ptx_to_cubin(ptx, arch))
+    return ptx
 
   if kernel_input == "ptx":
     ptx = render_vector_add_ptx(arch)
-    cubin = compile_ptx_to_cubin(ptx, arch)
     _write_if_requested(emit_ptx, ptx)
-    _write_if_requested(emit_cubin, cubin)
-    return cubin
-
-  if kernel_input == "cubin":
-    if cubin_path is None: raise ValueError("--cubin is required when --kernel-input cubin")
-    cubin = pathlib.Path(cubin_path).read_bytes()
-    _write_if_requested(emit_cubin, cubin)
-    return cubin
+    if emit_cubin is not None: _write_if_requested(emit_cubin, compile_ptx_to_cubin(ptx, arch))
+    return ptx
 
   raise ValueError(f"unsupported kernel input {kernel_input}")
 
@@ -174,7 +166,7 @@ def _make_kernel_params(args:VecAddArgs):
   return params, scalars
 
 
-def run_vector_add(size:int=256, block_size:int=64, launch_mode:str="extra", kernel_input:str="ptx", cubin_path:str|None=None,
+def run_vector_add(size:int=256, block_size:int=64, launch_mode:str="extra", kernel_input:str="ptx",
                    emit_ptx:str|None=None, emit_cubin:str|None=None) -> array.array:
   if block_size <= 0: raise ValueError(f"block_size must be positive, got {block_size}")
   _check(cuda.cuInit(0))
@@ -184,7 +176,7 @@ def run_vector_add(size:int=256, block_size:int=64, launch_mode:str="extra", ker
   _check(cuda.cuDeviceComputeCapability(ctypes.byref(major := ctypes.c_int()), ctypes.byref(minor := ctypes.c_int()), dev.value))
 
   arch = f"sm_{major.value}{minor.value}"
-  kernel_image = load_kernel_image(arch, kernel_input, cubin_path=cubin_path, emit_ptx=emit_ptx, emit_cubin=emit_cubin)
+  kernel_image = load_kernel_image(arch, kernel_input, emit_ptx=emit_ptx, emit_cubin=emit_cubin)
   module = init_c_var(cuda.CUmodule, lambda x: _check(cuda.cuModuleLoadData(ctypes.byref(x), kernel_image)))
   func = init_c_var(cuda.CUfunction, lambda x: _check(cuda.cuModuleGetFunction(ctypes.byref(x), module, KERNEL_NAME.encode())))
 
@@ -234,12 +226,11 @@ def main():
   parser.add_argument("--size", type=int, default=256)
   parser.add_argument("--block-size", type=int, default=64)
   parser.add_argument("--launch-mode", choices=["extra", "kernel_params"], default="extra")
-  parser.add_argument("--kernel-input", choices=["cuda", "ptx", "cubin"], default="ptx")
-  parser.add_argument("--cubin", help="Path to a prebuilt cubin when --kernel-input cubin is selected")
+  parser.add_argument("--kernel-input", choices=["cuda", "ptx"], default="ptx")
   parser.add_argument("--emit-ptx", help="Optional path to write the PTX used for this run")
   parser.add_argument("--emit-cubin", help="Optional path to write the cubin used for this run")
   args = parser.parse_args()
-  run_vector_add(size=args.size, block_size=args.block_size, launch_mode=args.launch_mode, kernel_input=args.kernel_input, cubin_path=args.cubin,
+  run_vector_add(size=args.size, block_size=args.block_size, launch_mode=args.launch_mode, kernel_input=args.kernel_input,
                  emit_ptx=args.emit_ptx, emit_cubin=args.emit_cubin)
   print(f"vector add ok, size={args.size}, launch_mode={args.launch_mode}, kernel_input={args.kernel_input}")
 

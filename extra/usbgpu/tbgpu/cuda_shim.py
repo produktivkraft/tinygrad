@@ -419,5 +419,5 @@ def cuStreamWaitEvent(stream, event, flags:int) -> int: return CUDA_SUCCESS
 def cuGetErrorString(error:int, pStr) -> int:
   if error not in _ERROR_BUFS:
     _ERROR_BUFS[error] = ctypes.create_string_buffer(orig_cuda.enum_cudaError_enum.get(error, "Unknown CUDA error").encode())
-  pStr._obj.value = ctypes.cast(_ERROR_BUFS[error], ctypes.POINTER(ctypes.c_char))
+  ctypes.cast(pStr, ctypes.POINTER(ctypes.POINTER(ctypes.c_char)))[0] = ctypes.cast(_ERROR_BUFS[error], ctypes.POINTER(ctypes.c_char))
   return CUDA_SUCCESS
