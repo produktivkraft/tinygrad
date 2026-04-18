@@ -1,11 +1,22 @@
 from __future__ import annotations
-import argparse, array, ctypes, pathlib, shutil, struct, subprocess, sys, tempfile
+import argparse, array, ctypes, pathlib, shutil, struct, subprocess
+
+import sys, tempfile, functools, os, pathlib
+
+if not getattr(tempfile, "_tmp_wrapped", False):
+  CWD = os.environ.get("PWD", "")
+  tempfile.TemporaryDirectory = functools.partial(
+      tempfile.TemporaryDirectory, dir="debug_agent", delete=False)
+  tempfile.NamedTemporaryFile = functools.partial(
+      tempfile.TemporaryDirectory, dir="debug_agent", delete=False)
+  tempfile.gettempdir = lambda: f"{CWD}/debug_agent"
+  tempfile._tmp_wrapped = True
 
 if __package__ in (None, ""):
   sys.path.insert(0, pathlib.Path(__file__).resolve().parents[3].as_posix())
 
 from extra.usbgpu.tbgpu import cuda_shim as cuda
-from tinygrad.runtime.support.c import del_an, init_c_var
+from tinygrad.runtime.support.c import init_c_var
 
 KERNEL_NAME = "vector_add"
 
@@ -180,9 +191,9 @@ def run_vector_add(size:int=256, block_size:int=64, launch_mode:str="extra", ker
   out = array.array('f', [0.0] * size)
 
   nbytes = size * ctypes.sizeof(ctypes.c_float)
-  d_a = del_an(cuda.CUdeviceptr)()
-  d_b = del_an(cuda.CUdeviceptr)()
-  d_out = del_an(cuda.CUdeviceptr)()
+  d_a = cuda.CUdeviceptr()
+  d_b = cuda.CUdeviceptr()
+  d_out = cuda.CUdeviceptr()
 
   try:
     _check(cuda.cuMemAlloc_v2(ctypes.byref(d_a), nbytes))

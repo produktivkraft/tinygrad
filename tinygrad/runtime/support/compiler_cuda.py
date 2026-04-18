@@ -63,7 +63,7 @@ class NVCCCompiler(Compiler):
     super().__init__(f"compile_nvcc_{cache_key+'ptx' if ptx else ''}_{self.arch}_{hashlib.sha256(' '.join(extra_options).encode()).hexdigest()[:8]}")
   def compile(self, src:str) -> bytes:
     mode, suffix = ("-ptx", ".ptx") if self.ptx else ("-cubin", ".cubin")
-    with tempfile.NamedTemporaryFile(dir="_demos", delete=False, suffix=".cu") as srcf, tempfile.NamedTemporaryFile(dir="_demos", delete=False, suffix=suffix) as libf:
+    with tempfile.NamedTemporaryFile(suffix=".cu") as srcf, tempfile.NamedTemporaryFile(suffix=suffix) as libf:
       srcf.write(src.encode())
       srcf.flush()
       system(f"nvcc -arch={self.arch} {mode} -o {libf.name} {srcf.name}" + ' '.join(self.extra_options))
